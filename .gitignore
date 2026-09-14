@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+.eggs/
+
+# Cython build artifacts (regenerate with build_omok.py)
+omok_ai.c
+*.so
+
+# Engine scratch
+rapfi_engine/rapfi.db
