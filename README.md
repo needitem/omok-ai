@@ -3,19 +3,20 @@
 A Gomoku / Renju (오목) move engine in pure Python, paired with the
 tournament-strength [Rapfi](https://github.com/dhbloo/rapfi) NNUE engine.
 
-The Python layer contributes exact **rule enforcement and tactical
-guarantees** that a raw search engine can miss:
+The Python layer contributes configurable **rule enforcement and tactical
+search**:
 
 - **Forbidden-move (금수) detection** for both colors — double-three (3·3),
   double-four (4·4), and overline (장목) — configurable per color and per rule
   (`renju` / `korean` / `standard` / `freestyle`).
-- **Proven wins**: a VCF/VCT-style prover (`prove_win_move`) that hard-guarantees
-  a forced win when one is provable, independent of the search engine.
+- **Proven wins**: a VCF/VCT-style prover (`prove_win_move`) under the configured
+  rule implementation, independent of the search engine. Nested false-three
+  cases use an approximation; this is not a complete official Renju ruleset.
 - **Immediate win / must-block** tactics computed deterministically.
 
-Rapfi provides the strong general search; the Python layer filters its output
-for legality (e.g. Rapfi treats only black as forbidden-bound) and overrides it
-with proven tactics when available.
+Rapfi provides the general search. Callers combining the two should validate
+its output with the Python rules and prefer proven tactics when available;
+the standalone Rapfi wrapper does not perform that filtering automatically.
 
 ## Layout
 
@@ -31,7 +32,7 @@ rapfi_engine/    # bundled Rapfi binary + NNUE weights (third-party, see NOTICE.
 ## Platform note
 
 The bundled `rapfi_engine/pbrain-rapfi` is a **Linux / ARM aarch64** build.
-It will not run on x86-64. For other platforms, build Rapfi from
+It will not run on x86-64 or macOS (including Apple Silicon). For other platforms, build Rapfi from
 [upstream](https://github.com/dhbloo/rapfi) and replace the binary (keep the
 `.lz4` weights, which are architecture-independent). The pure-Python
 `omok_ai.py` runs anywhere.
@@ -55,6 +56,44 @@ omok_ai.is_forbidden(b, 7, 8, omok_ai.BLACK, "renju")   # -> bool
 omok_ai.prove_win_move(b, omok_ai.BLACK, "renju", time_budget=1.5)
 ```
 
+For `renju` / `korean`, the Python default preserves the original app's rule:
+**both colors** forbid double-three, double-four and overline. To allow white
+to play without those restrictions, configure it explicitly:
+
+```python
+omok_ai.set_forbid(white={
+    "three_three": False, "four_four": False, "overline": False,
+})
+```
+
+`set_forbid` is process-wide configuration; set it before starting searches,
+and do not change it concurrently with an active search. Python's `standard`
+and `freestyle` both allow five or more stones, without forbidden moves. Their
+semantics are not guaranteed to match every Rapfi rule mode.
+
+### Timed Python search
+
+```python
+result = omok_ai.search_move(b, omok_ai.BLACK, time_budget=0.05)
+# result: move, score, reason, depth, timed_out, elapsed_ms; or None
+proof = omok_ai.prove_win_move_ex(b, omok_ai.BLACK, time_budget=0.05)
+# proof['status']: 'PROVEN_WIN', 'NO_PROOF', or 'TIMEOUT'
+```
+
+Search checks a shared monotonic deadline throughout candidate evaluation and
+recursive search, restoring temporary stones on interruption. `depth` is the
+last fully completed iteration; if none completed, a validated legal candidate
+is returned with depth 0. Zero/negative budgets, or expiration before any legal
+candidate is validated, return `None`. Checks are cooperative, so OS scheduling
+and one small in-progress operation can still cause slight deadline overshoot.
+
+`prove_win_move` retains its original move-or-`None` API. Use the `_ex` version
+to distinguish timeout from a completed search without a proof. Neither
+`NO_PROOF` nor `None` establishes that a position is safe. Attacking candidate
+and depth limits can miss wins; non-forcing proof branches enumerate every
+legal defensive square. A proven opponent attack point is not automatically
+a proven defensive move for the other player.
+
 ### Best move via Rapfi
 
 ```python
@@ -72,7 +111,7 @@ rapfi_bot.best_move_ex(board, 1, "korean", 400)
 # -> {'move': (r, c), 'pv': [(r, c), ...], 'eval': '...'}
 ```
 
-`rule` is one of `"korean"`, `"renju"` (both = black-forbidden ≈ standard renju),
+For the Rapfi wrapper, `rule` is one of `"korean"`, `"renju"` (both map to Rapfi rule 2),
 `"standard"`, `"freestyle"`.
 
 ### Combining both (recommended pattern)
@@ -92,6 +131,18 @@ python3 build_omok.py build_ext --inplace
 ```
 
 The resulting `omok_ai.*.so` shadows the `.py` on import — same logic, faster.
+
+## Validation and benchmarks
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 omok_ai.py
+python3 benchmarks/baseline.py --output benchmarks/after.json
+python3 benchmarks/deadlines.py --output benchmarks/deadlines.json
+```
+
+See [the implementation results](PERFORMANCE_RESULTS.md) for measured changes,
+remaining limitations and the original baseline.
 
 ## Licensing
 

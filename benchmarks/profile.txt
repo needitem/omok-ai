@@ -1,0 +1,31 @@
+         3467637 function calls in 0.286 seconds
+
+   Ordered by: cumulative time
+   List reduced from 50 to 25 due to restriction <25>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    0.286    0.286 omok_ai.py:704(search_move)
+     1005    0.002    0.000    0.242    0.000 omok_ai.py:215(is_forbidden)
+    64551    0.111    0.000    0.207    0.000 omok_ai.py:71(_states)
+     1007    0.000    0.000    0.173    0.000 {built-in method builtins.sum}
+     1082    0.000    0.000    0.173    0.000 omok_ai.py:240(<genexpr>)
+     4020    0.009    0.000    0.173    0.000 omok_ai.py:152(_open_three_in_dir)
+        3    0.000    0.000    0.146    0.049 omok_ai.py:362(_ordered)
+    41967    0.011    0.000    0.145    0.000 omok_ai.py:140(_open_four_through)
+        2    0.000    0.000    0.098    0.049 omok_ai.py:528(_forced_win_move)
+   834611    0.071    0.000    0.098    0.000 omok_ai.py:54(_in)
+        1    0.000    0.000    0.058    0.058 omok_ai.py:684(_root_search)
+        1    0.000    0.000    0.058    0.058 omok_ai.py:393(_negamax)
+        1    0.000    0.000    0.058    0.058 omok_ai.py:388(_evaluate)
+        2    0.000    0.000    0.058    0.029 omok_ai.py:374(_potential)
+     4012    0.012    0.000    0.038    0.000 omok_ai.py:177(_four_count_dir)
+     1158    0.003    0.000    0.038    0.000 omok_ai.py:264(place_score)
+     2481    0.002    0.000    0.036    0.000 omok_ai.py:100(is_win)
+  1599261    0.029    0.000    0.029    0.000 {built-in method builtins.len}
+    20032    0.003    0.000    0.021    0.000 {built-in method builtins.all}
+   105105    0.007    0.000    0.017    0.000 omok_ai.py:189(<genexpr>)
+     1003    0.001    0.000    0.014    0.000 omok_ai.py:114(_is_overline)
+   710533    0.014    0.000    0.014    0.000 {method 'append' of 'list' objects}
+    20031    0.005    0.000    0.005    0.000 omok_ai.py:188(<listcomp>)
+    22577    0.003    0.000    0.004    0.000 omok_ai.py:87(_run_through)
+     7106    0.001    0.000    0.002    0.000 omok_ai.py:62(_restricted_black)

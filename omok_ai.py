@@ -4,8 +4,8 @@ omok_ai.py — 오목 최선수 추천 엔진 (룰/색 인식, 렌주 금수 판
 
 지원:
   - 일반룰(standard): 양쪽 금수 없음, 5목 이상 승리.
-  - 렌주룰(renju): 흑만 금수(삼삼 3-3, 사사 4-4, 장목 6목↑). 흑은 정확히 5목 승리.
-                   백은 제한 없음·6목↑도 승리. 흑/백 로직 비대칭.
+  - renju/korean: 색별 FORBID_CFG 적용. 기본값은 앱 호환용 양색 금수.
+    공식 렌주처럼 백의 제한을 해제하려면 set_forbid(white=...)로 명시한다.
 
 board: 2차원 리스트. 0=빈칸, 1=흑(BLACK, 선), 2=백(WHITE).
 best_move(board, me, rule): 내(me) 차례의 최선수 {move,(r,c), reason, ...}.
@@ -17,6 +17,9 @@ best_move(board, me, rule): 내(me) 차례의 최선수 {move,(r,c), reason, ...
 """
 from __future__ import annotations
 import time
+from contextlib import contextmanager
+from functools import lru_cache
+import math
 
 SIZE = 15
 BLACK, WHITE = 1, 2
@@ -71,9 +74,10 @@ def _restricted_black(p, rule):
 def _states(b, r, c, dr, dc, p, half=5):
     """(r,c) 기준 (dr,dc)축으로 -half..+half 셀 상태: 'O'=내돌 '.'=빈 '#'=상대/벽."""
     s = []
+    rows, cols = len(b), len(b[0])
     for k in range(-half, half + 1):
         rr, cc = r + dr * k, c + dc * k
-        if not _in(b, rr, cc):
+        if not (0 <= rr < rows and 0 <= cc < cols):
             s.append('#')
         elif b[rr][cc] == p:
             s.append('O')
@@ -97,12 +101,24 @@ def _run_through(states, center):
 
 
 # ── 승리/장목 판정 ──────────────────────────────────────────────
+def _line_run(b, r, c, dr, dc, p):
+    """Count through a placed stone without allocating a line buffer."""
+    rows, cols = len(b), len(b[0])
+    count = 1
+    for sign in (-1, 1):
+        for k in range(1, 6):
+            rr, cc = r + sign * dr * k, c + sign * dc * k
+            if not (0 <= rr < rows and 0 <= cc < cols) or b[rr][cc] != p:
+                break
+            count += 1
+    return count
+
+
 def is_win(b, r, c, p, rule):
     """(r,c)에 p 를 둔 상태에서 승리인가. 렌주 흑=정확히 5, 그 외=5 이상."""
     exact = _restricted_black(p, rule)        # 그 색 overline 금지 → 정확히 5만 승리
     for dr, dc in DIRS:
-        st = _states(b, r, c, dr, dc, p)
-        run = _run_through(st, 5)
+        run = _line_run(b, r, c, dr, dc, p)
         if exact:
             if run == 5:
                 return True
@@ -113,8 +129,7 @@ def is_win(b, r, c, p, rule):
 
 def _is_overline(b, r, c, p):
     for dr, dc in DIRS:
-        st = _states(b, r, c, dr, dc, p)
-        if _run_through(st, 5) >= 6:
+        if _line_run(b, r, c, dr, dc, p) >= 6:
             return True
     return False
 
@@ -152,14 +167,32 @@ def _open_four_through(b, r, c, dr, dc, p):
 def _open_three_in_dir(b, r, c, dr, dc, p):
     """이 방향에서 활삼(한 수로 열린4 가능)인가. 이미 사(4연속↑)면 삼 아님 —
     이게 없으면 이중사(44)를 이중삼(33)으로 오판해 흑 44 를 잘못 금수 처리함."""
-    if _run_through(_states(b, r, c, dr, dc, p), 5) >= 4:
+    # Both old probes (center and trial stone +/-4) read +/-5 cells.
+    # Extract their union once; the cached key contains only relative stones,
+    # so it is independent of board identity, player and rule configuration.
+    return _line_open_three(tuple(_states(b, r, c, dr, dc, p, half=9)))
+
+
+def _line_open_four(st, center):
+    left = right = center
+    while left > 0 and st[left - 1] == 'O':
+        left -= 1
+    while right + 1 < len(st) and st[right + 1] == 'O':
+        right += 1
+    return (right - left == 3 and left > 0 and right + 1 < len(st)
+            and st[left - 1] == '.' and st[right + 1] == '.')
+
+
+@lru_cache(maxsize=8192)
+def _line_open_three(line):
+    if _run_through(line, 9) >= 4:
         return False
-    for k in range(-4, 5):
-        rr, cc = r + dr * k, c + dc * k
-        if _in(b, rr, cc) and b[rr][cc] == 0:
-            b[rr][cc] = p
-            of = _open_four_through(b, r, c, dr, dc, p) or _open_four_through(b, rr, cc, dr, dc, p)
-            b[rr][cc] = 0
+    st = list(line)
+    for index in range(5, 14):
+        if st[index] == '.':
+            st[index] = 'O'
+            of = _line_open_four(st, 9) or _line_open_four(st, index)
+            st[index] = '.'
             if of:
                 return True
     return False
@@ -228,6 +261,8 @@ def is_forbidden(b, r, c, p, rule):
             return False
         if cfg.get("overline", False) and _is_overline(b, r, c, p):              # 장목(6목↑)
             return True
+        if not cfg.get("four_four", False) and not cfg.get("three_three", False):
+            return False
         fdir = {}
         ftot = 0
         for dr, dc in DIRS:
@@ -238,7 +273,7 @@ def is_forbidden(b, r, c, p, rule):
             return True
         if cfg.get("three_three", False):                                        # 삼삼(33)
             three = sum(1 for dr, dc in DIRS
-                        if _open_three_in_dir(b, r, c, dr, dc, p) and fdir[(dr, dc)] == 0)
+                        if fdir[(dr, dc)] == 0 and _open_three_in_dir(b, r, c, dr, dc, p))
             if three >= 2:                    # 거짓삼(사와 같은 방향) 제외 후 삼 2개↑
                 return True
         return False
@@ -359,418 +394,437 @@ def _reason(bm, me, rule):
 INF = 1 << 62
 
 
-def _ordered(b, me, rule, width):
-    """후보를 (내 이득+상대 이득) 내림차순 정렬해 상위 width개. 흑 금수는 제외."""
+class _SearchTimeout(Exception):
+    """An interrupted search has no score and proves neither win nor defense."""
+
+
+def _check_deadline(deadline):
+    if deadline is not None and time.perf_counter() >= deadline:
+        raise _SearchTimeout
+
+
+def _deadline(start, budget):
+    if not math.isfinite(budget):
+        raise ValueError("time_budget must be finite")
+    return start + max(0.0, budget)
+
+
+@contextmanager
+def _placed(b, r, c, p):
+    previous = b[r][c]
+    b[r][c] = p
+    try:
+        yield
+    finally:
+        b[r][c] = previous
+
+
+def _ordered(b, me, rule, width, deadline=None):
+    """Score legal candidates; interruption never returns a partial ordering."""
     scored = []
-    for (r, c) in _candidates(b):
+    _check_deadline(deadline)
+    for r, c in _candidates(b):
+        _check_deadline(deadline)
         if is_forbidden(b, r, c, me, rule):
             continue
-        s = place_score(b, r, c, me, rule) + place_score(b, r, c, opp(me), rule)
-        scored.append((s, r, c))
+        defense = (0 if is_forbidden(b, r, c, opp(me), rule)
+                   else place_score(b, r, c, opp(me), rule))
+        scored.append((place_score(b, r, c, me, rule) + defense, r, c))
+    _check_deadline(deadline)
     scored.sort(reverse=True)
     return [(r, c) for _, r, c in scored[:width]]
 
 
-def _potential(b, p, rule):
-    """p의 위협 잠재력 = 최고 위협 + 둘째 위협 일부(이중위협 인지). radius1 근접만(속도)."""
+def _potential(b, p, rule, deadline=None):
     top = second = 0
-    for (r, c) in _candidates(b, radius=1):
-        if b[r][c] != 0 or is_forbidden(b, r, c, p, rule):
+    _check_deadline(deadline)
+    for r, c in _candidates(b, radius=1):
+        _check_deadline(deadline)
+        if is_forbidden(b, r, c, p, rule):
             continue
-        s = place_score(b, r, c, p, rule)
-        if s > top:
-            second = top; top = s
-        elif s > second:
-            second = s
-    # 둘째 위협 보너스(상한 OPEN3): 활삼 2개·사삼 같은 콤보를 단일 위협보다 높게 평가
+        score = place_score(b, r, c, p, rule)
+        if score > top:
+            second, top = top, score
+        elif score > second:
+            second = score
+    _check_deadline(deadline)
     return top + min(second, OPEN3) // 2
 
-def _evaluate(b, me, rule):
-    """정적 평가: 내 잠재력 - 상대 잠재력(이중위협 반영)."""
-    return _potential(b, me, rule) - _potential(b, opp(me), rule)
+
+def _evaluate(b, me, rule, deadline=None):
+    return (_potential(b, me, rule, deadline)
+            - _potential(b, opp(me), rule, deadline))
+
+
+def _gain_points(b, p, rule, deadline=None, limit=None):
+    """Immediate wins. Current rule semantics give a completed five priority
+    over forbidden patterns, so a winning point needs no extra ban scan."""
+    points = []
+    _check_deadline(deadline)
+    for r, c in _candidates(b, radius=1):
+        _check_deadline(deadline)
+        with _placed(b, r, c, p):
+            win = is_win(b, r, c, p, rule)
+        if win:
+            points.append((r, c))
+            if limit is not None and len(points) >= limit:
+                break
+    _check_deadline(deadline)
+    return points
+
+
+def _immediate_win_pt(b, p, rule, deadline=None):
+    points = _gain_points(b, p, rule, deadline, limit=1)
+    return points[0] if points else None
 
 
 def _negamax(b, me, rule, depth, alpha, beta, deadline):
-    if depth == 0 or time.time() > deadline:   # 시간초과 → 더 안 파고 정적평가로 수렴
-        return _evaluate(b, me, rule)
-    cands = _ordered(b, me, rule, width=6)
+    _check_deadline(deadline)
+    if _immediate_win_pt(b, me, rule, deadline) is not None:
+        return WIN + depth
+    o = opp(me)
+    threats = _gain_points(b, o, rule, deadline, limit=2)
+    if len(threats) > 1:
+        return -WIN - depth
+    if threats and is_forbidden(b, *threats[0], me, rule):
+        return -WIN - depth
+    if depth == 0:
+        return _evaluate(b, me, rule, deadline)
+    # Forced defenses must not be lost to the ordinary width cap.
+    cands = threats or _ordered(b, me, rule, width=6, deadline=deadline)
     if not cands:
         return 0
-    o = opp(me)
     best = -INF
-    for (r, c) in cands:
-        b[r][c] = me
-        if is_win(b, r, c, me, rule):
-            b[r][c] = 0
-            return WIN + depth                 # 빠른 승리 선호
-        val = -_negamax(b, o, rule, depth - 1, -beta, -alpha, deadline)
-        b[r][c] = 0
-        if val > best:
-            best = val
-        if val > alpha:
-            alpha = val
+    for r, c in cands:
+        _check_deadline(deadline)
+        with _placed(b, r, c, me):
+            val = -_negamax(b, o, rule, depth - 1, -beta, -alpha, deadline)
+        best = max(best, val)
+        alpha = max(alpha, val)
         if alpha >= beta:
             break
+    _check_deadline(deadline)
     return best
 
 
-# ── VCF: 연속 사(四) 강제승 탐색 (위협공간탐색) ─────────────────
-def _gain_points(b, p, rule):
-    """빈칸 중 p가 두면 즉시 5(승리)가 되는 점 = 상대가 반드시 막아야 할 완성점."""
-    pts = []
-    for (r, c) in _candidates(b, radius=1):
-        if b[r][c] != 0:
-            continue
-        b[r][c] = p
-        w = is_win(b, r, c, p, rule)
-        b[r][c] = 0
-        if w:
-            pts.append((r, c))
-    return pts
-
-def _forcing_moves(b, me, rule):
-    """me가 두면 사(four) 이상 — 상대에게 5 위협을 걸어 응수를 강제하는 수들."""
+def _forcing_moves(b, me, rule, deadline=None):
     out = []
-    for (r, c) in _candidates(b, radius=1):
-        if b[r][c] != 0 or is_forbidden(b, r, c, me, rule):
+    _check_deadline(deadline)
+    for r, c in _candidates(b, radius=1):
+        _check_deadline(deadline)
+        if is_forbidden(b, r, c, me, rule):
             continue
-        b[r][c] = me
-        force = is_win(b, r, c, me, rule) or count_fours(b, r, c, me, rule) >= 1
-        b[r][c] = 0
+        with _placed(b, r, c, me):
+            force = is_win(b, r, c, me, rule) or count_fours(b, r, c, me, rule) >= 1
         if force:
             out.append((r, c))
+    _check_deadline(deadline)
     return out
 
+
 def _vcf(b, me, rule, depth, deadline):
-    """me 차례에 '연속 사(VCF)'로 강제승이면 그 첫 수 반환, 아니면 None.
-    각 사는 상대가 유일 완성점을 막도록 강제; 완성점 2개↑(열린4/이중4)·즉승이면 승리."""
-    if depth <= 0 or time.time() > deadline:
+    """Prove consecutive-four wins; timeout raises, no proof returns None."""
+    _check_deadline(deadline)
+    if depth <= 0:
         return None
     o = opp(me)
-    for (r, c) in _forcing_moves(b, me, rule):
-        b[r][c] = me
-        if is_win(b, r, c, me, rule):
-            b[r][c] = 0
-            return (r, c)
-        gp = _gain_points(b, me, rule)
-        if len(gp) >= 2:                             # 막을 수 없는 이중 위협(열린4/이중4)
-            b[r][c] = 0
-            return (r, c)
-        if len(gp) == 1:
-            br, bc = gp[0]
-            if is_forbidden(b, br, bc, o, rule):     # 상대가 완성점에 못 둠(렌주 흑 금수)=승리
-                b[r][c] = 0
+    for r, c in _forcing_moves(b, me, rule, deadline):
+        _check_deadline(deadline)
+        with _placed(b, r, c, me):
+            if is_win(b, r, c, me, rule):
                 return (r, c)
-            b[br][bc] = o                             # 상대 강제 방어
-            follow = _vcf(b, me, rule, depth - 1, deadline)
-            b[br][bc] = 0
-            b[r][c] = 0
-            if follow is not None:
+            # The opponent moves next and can win before our double threat.
+            if _immediate_win_pt(b, o, rule, deadline) is not None:
+                continue
+            gp = _gain_points(b, me, rule, deadline)
+            if len(gp) >= 2:
                 return (r, c)
-            continue
-        b[r][c] = 0
+            if len(gp) == 1:
+                br, bc = gp[0]
+                if is_forbidden(b, br, bc, o, rule):
+                    return (r, c)
+                with _placed(b, br, bc, o):
+                    follow = _vcf(b, me, rule, depth - 1, deadline)
+                if follow is not None:
+                    return (r, c)
+    _check_deadline(deadline)
     return None
 
 
-def _winning_followups(b, me, rule, limit=6):
-    """me가 지금 두면 '막을 수 없는 승리위협'(5완성 or 완성점 2개↑=열린4/이중4)이 되는 자리들."""
+def _winning_followups(b, me, rule, limit=6, deadline=None):
     out = []
-    for (r, c) in _candidates(b, radius=1):
-        if b[r][c] != 0 or is_forbidden(b, r, c, me, rule):
+    _check_deadline(deadline)
+    for r, c in _candidates(b, radius=1):
+        _check_deadline(deadline)
+        if is_forbidden(b, r, c, me, rule):
             continue
-        b[r][c] = me
-        strong = is_win(b, r, c, me, rule) or len(_gain_points(b, me, rule)) >= 2
-        b[r][c] = 0
+        with _placed(b, r, c, me):
+            strong = is_win(b, r, c, me, rule)
+            if not strong:
+                strong = (len(_gain_points(b, me, rule, deadline, limit=2)) >= 2
+                          and _immediate_win_pt(b, opp(me), rule, deadline) is None)
         if strong:
             out.append((r, c))
             if len(out) >= limit:
                 break
+    _check_deadline(deadline)
     return out
 
-def _threats_created(b, r, c, p, rule):
-    """(r,c)에 p 둘 때 (r,c)를 지나는 (사 개수, 활삼 개수). = 그 수가 '만든' 위협."""
-    b[r][c] = p
-    nf = count_fours(b, r, c, p, rule)
-    n3 = count_open_threes(b, r, c, p)
-    b[r][c] = 0
-    return nf, n3
 
-def _fork_unstoppable(b, me, o, fr, fc, rule):
-    """me가 (fr,fc)에 포크를 둔 상태에서 상대가 한 수로 못 막으면 True(필승)."""
-    b[fr][fc] = me
-    try:
-        for (r, c) in _candidates(b, radius=1):          # 상대 즉승(5) 반격이면 필승 아님
-            if b[r][c] != 0 or is_forbidden(b, r, c, o, rule):
-                continue
-            b[r][c] = o; w = is_win(b, r, c, o, rule); b[r][c] = 0
-            if w:
-                return False
-        wins = _winning_followups(b, me, rule)            # 포크가 만든 승리위협들
-        if len(wins) < 2:
+def _threats_created(b, r, c, p, rule):
+    with _placed(b, r, c, p):
+        return count_fours(b, r, c, p, rule), count_open_threes(b, r, c, p)
+
+
+def _legal_defenses(b, p, rule, deadline):
+    """Proofs enumerate every legal reply, including distant counterplay."""
+    for r, row in enumerate(b):
+        for c, value in enumerate(row):
+            _check_deadline(deadline)
+            if value == 0 and not is_forbidden(b, r, c, p, rule):
+                yield r, c
+
+
+def _fork_unstoppable(b, me, o, fr, fc, rule, deadline=None):
+    _check_deadline(deadline)
+    with _placed(b, fr, fc, me):
+        if _immediate_win_pt(b, o, rule, deadline) is not None:
             return False
-        cand = set(wins)                                  # 상대 차단 후보 = 위협점 ∪ 주변
-        for (wr, wc) in wins:
-            for dr in (-1, 0, 1):
-                for dc in (-1, 0, 1):
-                    rr, cc = wr + dr, wc + dc
-                    if _in(b, rr, cc) and b[rr][cc] == 0:
-                        cand.add((rr, cc))
-        for (r, c) in cand:                               # 상대가 한 수로 다 막으면 필승 아님
-            b[r][c] = o
-            rem = _winning_followups(b, me, rule, limit=1)
-            b[r][c] = 0
-            if not rem:
-                return False
-        return True
-    finally:
-        b[fr][fc] = 0
+        if len(_winning_followups(b, me, rule, limit=2, deadline=deadline)) < 2:
+            return False
+        checked = False
+        for r, c in _legal_defenses(b, o, rule, deadline):
+            checked = True
+            with _placed(b, r, c, o):
+                if is_win(b, r, c, o, rule):
+                    return False
+                if not _winning_followups(b, me, rule, limit=1, deadline=deadline):
+                    return False
+        _check_deadline(deadline)
+        return checked
+
 
 def _forced_win_move(b, me, rule, deadline):
-    """한 수로 '막을 수 없는 포크'(그 수를 지나는 44·사삼·삼삼 이중위협)를 만드는 수. 없으면 None.
-    VCF(연속 사)가 못 잡는 활삼 콤보 필승수를 잡는다. 위협을 '그 수가 만든 것'으로 한정해
-    이미 있던 위협을 오인하지 않는다. 후보는 위협 상위 16칸만(포크는 항상 고위협 자리)."""
-    o = opp(me)
-    for (r, c) in _ordered(b, me, rule, 16):
-        b[r][c] = me; w = is_win(b, r, c, me, rule); b[r][c] = 0
-        if w:
-            return (r, c)
-        nf, n3 = _threats_created(b, r, c, me, rule)
-        if (nf >= 2 or (nf >= 1 and n3 >= 1) or n3 >= 2):   # 이 수가 만든 이중위협
-            if _fork_unstoppable(b, me, o, r, c, rule):
+    for r, c in _ordered(b, me, rule, 16, deadline):
+        _check_deadline(deadline)
+        with _placed(b, r, c, me):
+            if is_win(b, r, c, me, rule):
                 return (r, c)
-        if time.time() > deadline:
-            break
+        nf, n3 = _threats_created(b, r, c, me, rule)
+        if nf >= 2 or (nf >= 1 and n3 >= 1) or n3 >= 2:
+            if _fork_unstoppable(b, me, opp(me), r, c, rule, deadline):
+                return (r, c)
+    _check_deadline(deadline)
     return None
 
 
-# ── VCT: 위협연쇄 강제승 (사+활삼 콤보). 건전성 최우선 ──────────────
-#   설계 원칙(거짓 '필승' 절대 금지):
-#     · 방어(상대) 응수 열거는 '완전한 상위집합'이어야 한다 → 놓친 반박수로 오판 방지.
-#         - 내가 사(四)를 만들어 완성점이 정확히 1개면 상대는 그 점을 막을 수밖에 없다(유일 응수).
-#         - 내가 활삼만 만들면(완성점 0개) 상대는 아무 데나 둘 수 있다 → 반경2 후보 전체를 응수로 검사.
-#     · 공격수(내 위협수) 열거는 가지치기해도 됨 → 완전성만 손해, 건전성엔 무해.
-#     · deadline 초과 시 항상 None 반환 → 타임아웃은 보수적(승리 주장 안 함).
-def _immediate_win_pt(b, p, rule):
-    """p 가 지금 한 수로 5를 만들 수 있는 (합법) 빈칸이 있으면 그 점, 없으면 None."""
-    for (r, c) in _candidates(b, radius=1):
-        if b[r][c] != 0 or is_forbidden(b, r, c, p, rule):
-            continue
-        b[r][c] = p
-        w = is_win(b, r, c, p, rule)
-        b[r][c] = 0
-        if w:
-            return (r, c)
-    return None
-
-
-def _threat_moves_vct(b, me, rule, three_cap=8):
-    """공격 위협수: (a) 사 이상(강제) 먼저, (b) 활삼(비강제) 나중.
-    활삼수는 three_cap 개로 제한(완전성만 영향, 건전성 무해). 반환: [(r,c)...]."""
+def _threat_moves_vct(b, me, rule, three_cap=8, deadline=None):
     fours, threes = [], []
-    for (r, c) in _candidates(b, radius=1):
-        if b[r][c] != 0 or is_forbidden(b, r, c, me, rule):
+    _check_deadline(deadline)
+    for r, c in _candidates(b, radius=1):
+        _check_deadline(deadline)
+        if is_forbidden(b, r, c, me, rule):
             continue
         nf, n3 = _threats_created(b, r, c, me, rule)
         if nf >= 1:
             fours.append((r, c))
         elif n3 >= 1:
             threes.append((r, c))
+    _check_deadline(deadline)
     return fours + threes[:three_cap]
 
 
 def _vct(b, me, rule, depth, deadline):
-    """me 차례에 사·활삼 위협연쇄로 '증명된 강제승'이면 첫 수, 아니면 None.
-    건전: 승리 주장은 모든 상대 응수를 반박했을 때만. 타임아웃/불확실은 None."""
-    if depth <= 0 or time.time() > deadline:
+    """Only a proof over all legal replies can return a winning move."""
+    _check_deadline(deadline)
+    if depth <= 0:
         return None
+    immediate = _immediate_win_pt(b, me, rule, deadline)
+    if immediate is not None:
+        return immediate
     o = opp(me)
-    for (r, c) in _threat_moves_vct(b, me, rule):
-        b[r][c] = me
-        try:
-            if is_win(b, r, c, me, rule):
-                return (r, c)                              # 5 완성
-            gp = _gain_points(b, me, rule)                 # 이 수 후 내 즉승점
-            if len(gp) >= 2:
-                return (r, c)                              # 이중 완성점(열린4/이중4) = 막을 수 없음
-            # 상대가 지금 즉승 가능하면 내 공격은 반박됨(상대가 그냥 이김)
-            if _immediate_win_pt(b, o, rule) is not None:
+    for r, c in _threat_moves_vct(b, me, rule, deadline=deadline):
+        _check_deadline(deadline)
+        with _placed(b, r, c, me):
+            if _immediate_win_pt(b, o, rule, deadline) is not None:
                 continue
-            if len(gp) == 1:
+            gp = _gain_points(b, me, rule, deadline)
+            if len(gp) >= 2:
+                return (r, c)
+            if gp:
                 br, bc = gp[0]
                 if is_forbidden(b, br, bc, o, rule):
-                    return (r, c)                          # 유일 방어점이 상대 금수 → 승리
-                b[br][bc] = o                              # 상대 유일 강제 방어
-                sub = _vct(b, me, rule, depth - 1, deadline)
-                b[br][bc] = 0
+                    return (r, c)
+                with _placed(b, br, bc, o):
+                    sub = _vct(b, me, rule, depth - 1, deadline)
                 if sub is not None:
                     return (r, c)
                 continue
-            # gp==0: 활삼만 만든 수 → 상대는 임의 응수 가능. '완전한' 응수 집합을 전부 반박해야 승리.
-            defenses = [(dr, dc) for (dr, dc) in _candidates(b, radius=2) if b[dr][dc] == 0]
-            won_all = bool(defenses)
-            for (dr, dc) in defenses:
-                if is_forbidden(b, dr, dc, o, rule):
-                    continue                               # 상대가 못 두는 자리는 응수 후보 아님
-                b[dr][dc] = o
-                sub = _vct(b, me, rule, depth - 1, deadline)
-                b[dr][dc] = 0
+            checked = False
+            for dr, dc in _legal_defenses(b, o, rule, deadline):
+                checked = True
+                with _placed(b, dr, dc, o):
+                    sub = _vct(b, me, rule, depth - 1, deadline)
                 if sub is None:
-                    won_all = False
                     break
-                if time.time() > deadline:
-                    won_all = False
-                    break
-            if won_all:
-                return (r, c)
-        finally:
-            b[r][c] = 0
+            else:
+                _check_deadline(deadline)
+                if checked:
+                    return (r, c)
+    _check_deadline(deadline)
     return None
 
 
+def _proof_stage(fn, *args):
+    try:
+        move = fn(*args)
+        return ("PROVEN_WIN", move) if move is not None else ("NO_PROOF", None)
+    except _SearchTimeout:
+        return "TIMEOUT", None
+
+
+def prove_win_move_ex(b, me, rule="renju", time_budget=2.0):
+    """Return status PROVEN_WIN, NO_PROOF or TIMEOUT under configured rules.
+
+    NO_PROOF is not a proof of loss: attacker candidates and depth are limited.
+    This retains the engine's approximate forbidden-move semantics.
+    """
+    start = time.perf_counter()
+    deadline = _deadline(start, time_budget)
+    timed_out = False
+    try:
+        immediate = _immediate_win_pt(b, me, rule, deadline)
+        if immediate is not None:
+            return {"status": "PROVEN_WIN", "move": immediate, "reason": "즉시 승리(5목)"}
+        stages = (
+            (_vcf, (b, me, rule, 24, min(deadline, start + time_budget * .35)), "강제승(연속 사·VCF)"),
+            (_forced_win_move, (b, me, rule, min(deadline, start + time_budget * .5)), "필승수(포크·이중위협)"),
+            (_vct, (b, me, rule, 12, deadline), "강제승(위협연쇄·VCT)"),
+        )
+        for fn, args, reason in stages:
+            _check_deadline(deadline)
+            status, move = _proof_stage(fn, *args)
+            if status == "PROVEN_WIN":
+                return {"status": status, "move": move, "reason": reason}
+            timed_out |= status == "TIMEOUT"
+    except _SearchTimeout:
+        timed_out = True
+    return {"status": "TIMEOUT" if timed_out else "NO_PROOF", "move": None}
+
+
 def prove_win_move(b, me, rule="renju", time_budget=2.0):
-    """'증명된 강제승' 첫 수를 반환(없으면 None). 건전성 보장 — 반환 시 반드시 필승.
-    순서: 즉승 → VCF(연속 사, 깊게) → 포크(이중위협) → VCT(사+활삼 연쇄).
-    time_budget(초) 를 실제로 다 쓴다(우선순위-0 하드캡 0.15s 문제 해소)."""
-    t0 = time.time()
-    o = opp(me)
-    # 즉승
-    for (r, c) in _candidates(b, radius=1):
-        if b[r][c] != 0 or is_forbidden(b, r, c, me, rule):
-            continue
-        b[r][c] = me; w = is_win(b, r, c, me, rule); b[r][c] = 0
-        if w:
-            return {"move": (r, c), "reason": "즉시 승리(5목)"}
-    # ★방어 우선: 상대가 이미 '사(四)→오목' 즉승 위협을 가지면, 내 강제승은 그걸 막는 수여야만 유효.
-    #  (막지 않으면 상대가 다음 수에 오목 완성 → 내 VCF/VCT 는 허상. 이게 '상대 사 무시' 버그의 원인.)
-    opp_now = _gain_points(b, o, rule)          # 상대가 지금 두면 5가 되는 점(상대의 기존 사 완성점)
-    if opp_now:
-        if len(opp_now) >= 2:                    # 완성점 2개↑ → 한 수로 못 막음(즉승만 승리, 위에서 없음)
-            return None
-        br, bc = opp_now[0]
-        if is_forbidden(b, br, bc, me, rule):    # 유일 방어점이 내 금수 → 방어 불가
-            return None
-        b[br][bc] = me                           # 그 점을 막아본다
-        try:
-            win_after = (is_win(b, br, bc, me, rule)
-                         or len(_gain_points(b, me, rule)) >= 2
-                         or _fork_unstoppable(b, me, o, br, bc, rule))
-        finally:
-            b[br][bc] = 0
-        # 막으면서 이기면 그 방어수가 곧 필승수. 아니면 강제승 주장 안 함(→ Rapfi 가 방어).
-        return {"move": opp_now[0], "reason": "상대 사 차단 + 필승"} if win_after else None
-    # VCF (연속 사) — 깊고 예산 넉넉히
-    vm = _vcf(b, me, rule, depth=24, deadline=t0 + time_budget * 0.35)
-    if vm is not None:
-        return {"move": vm, "reason": "강제승(연속 사·VCF)"}
-    # 포크 (한 수 이중위협)
-    fm = _forced_win_move(b, me, rule, t0 + time_budget * 0.5)
-    if fm is not None:
-        return {"move": fm, "reason": "필승수(포크·이중위협)"}
-    # VCT (사+활삼 위협연쇄)
-    tm = _vct(b, me, rule, depth=12, deadline=t0 + time_budget)
-    if tm is not None:
-        return {"move": tm, "reason": "강제승(위협연쇄·VCT)"}
+    """Compatibility API: a proven move, or None for timeout/no proof.
+
+    Use prove_win_move_ex to distinguish those outcomes. None never establishes
+    that a position is safe, or that the opponent has no winning sequence.
+    """
+    result = prove_win_move_ex(b, me, rule, time_budget)
+    if result["status"] == "PROVEN_WIN":
+        return {"move": result["move"], "reason": result["reason"]}
     return None
 
 
 def opponent_forced_win(b, me, rule="renju", time_budget=1.0):
-    """상대가 '증명된 강제승'을 갖고 있으면 그 첫 수(=우리가 선점/차단할 급소) 반환, 없으면 None.
-    상대 관점에서 prove_win_move 를 돌린다(방어용)."""
-    o = opp(me)
-    r = prove_win_move(b, o, rule, time_budget)
-    return r["move"] if r else None
+    """An opponent's proven attacking move; occupying it is not a defense proof."""
+    result = prove_win_move(b, opp(me), rule, time_budget)
+    return result["move"] if result else None
 
 
 def _root_search(b, me, o, rule, cands, depth, deadline):
-    """루트에서 cands 를 depth 로 평가해 최선 {move,score} 반환(즉승은 _win 표시)."""
     best = None
     alpha, beta = -INF, INF
-    for (r, c) in cands:
-        if best is not None and time.time() > deadline:
-            break
-        b[r][c] = me
-        if is_win(b, r, c, me, rule):
-            b[r][c] = 0
-            return {"move": (r, c), "score": WIN, "_win": True}
-        val = -_negamax(b, o, rule, depth - 1, -beta, -alpha, deadline)
-        b[r][c] = 0
+    for r, c in cands:
+        _check_deadline(deadline)
+        with _placed(b, r, c, me):
+            if is_win(b, r, c, me, rule):
+                return {"move": (r, c), "score": WIN, "_win": True}
+            val = -_negamax(b, o, rule, depth - 1, -beta, -alpha, deadline)
         if best is None or val > best["score"]:
             best = {"move": (r, c), "score": val}
-        if val > alpha:
-            alpha = val
+        alpha = max(alpha, val)
+    _check_deadline(deadline)
     return best
 
 
 def search_move(b, me, rule="renju", depth=6, width=12, time_budget=0.5):
-    """알파-베타 탐색으로 최선수. 즉승·VCF강제승·필수방어는 즉시 처리, 그 외 depth 앞을 내다본다.
-    time_budget(초) 하드 상한: 초과 시 지금까지 최선(정렬 상위)으로 즉시 반환 →
-    조용한 판에서 수 초씩 걸리던 것을 상한 내로 고정(품질 손실 미미: 깊게 파도 답 거의 동일)."""
-    cands = _candidates(b)
-    if all(b[r][c] == 0 for r in range(len(b)) for c in range(len(b[0]))):
-        rc = (len(b) // 2, len(b) // 2)
-        return {"move": rc, "score": 0, "reason": "첫 수(중앙)", "depth": depth}
-    o = opp(me)
-    t0 = time.time()
-    # 1) 즉승수
-    for (r, c) in cands:
-        if is_forbidden(b, r, c, me, rule):
-            continue
-        b[r][c] = me; win = is_win(b, r, c, me, rule); b[r][c] = 0
-        if win:
-            return {"move": (r, c), "score": WIN, "reason": "즉시 승리(5목)", "depth": 0}
-    # 1.5) VCF — 연속 사(四)로 강제승이 있으면 즉시 그 수
-    vm = _vcf(b, me, rule, depth=10, deadline=t0 + min(time_budget * 0.35, 0.15))
-    if vm is not None:
-        return {"move": vm, "score": WIN, "reason": "강제승 발견(연속 사·VCF)", "depth": 0}
-    # 1.6) 포크 필승수 — VCF 가 못 잡는 이중위협(사삼·삼삼) 강제승
-    fm = _forced_win_move(b, me, rule, t0 + min(time_budget * 0.55, 0.22))
-    if fm is not None:
-        return {"move": fm, "score": WIN, "reason": "필승수(포크·이중위협)", "depth": 0}
-    # 2) 상대 즉승 저지(상대가 둘 수 있는 자리만)
-    for (r, c) in cands:
-        if is_forbidden(b, r, c, o, rule):
-            continue
-        b[r][c] = o; owin = is_win(b, r, c, o, rule); b[r][c] = 0
-        if owin and not is_forbidden(b, r, c, me, rule):
-            return {"move": (r, c), "score": WIN // 2, "reason": "상대 5목 저지(필수 방어)", "depth": 0}
-    # 2.5) 상대 VCF 저지 — 상대에게 연속 사 강제승 수순이 있으면 그걸 깨는 수 우선
-    if _vcf(b, o, rule, depth=10, deadline=t0 + min(time_budget * 0.3, 0.12)) is not None:
-        for (r, c) in _ordered(b, me, rule, width)[:12]:
-            if is_forbidden(b, r, c, me, rule):
-                continue
-            b[r][c] = me
-            broke = _vcf(b, o, rule, depth=10, deadline=time.time() + 0.05) is None
-            b[r][c] = 0
-            if broke:
-                return {"move": (r, c), "score": WIN // 2, "reason": "상대 강제승(VCF) 저지", "depth": 0}
-    # 2.6) 상대 포크 저지 — 상대의 필승 포크 급소를 선점
-    ofm = _forced_win_move(b, o, rule, t0 + min(time_budget * 0.75, 0.3))
-    if ofm is not None and not is_forbidden(b, ofm[0], ofm[1], me, rule):
-        return {"move": ofm, "score": WIN // 2, "reason": "상대 필승수(포크) 저지", "depth": 0}
-    # 3) 반복심화 알파-베타: 얕은 결과부터 확보하며 시간 되는 만큼 깊이 확장.
-    #    각 반복 후 최선수를 맨 앞으로 재정렬 → 다음 반복에서 컷 증가(가속).
-    deadline = t0 + time_budget
-    cands = _ordered(b, me, rule, width)
-    if not cands:
-        return None
-    best = {"move": cands[0], "score": 0}
-    reached = 1
-    for d in range(2, depth + 1):
-        r = _root_search(b, me, o, rule, cands, d, deadline)
-        if r:
-            best = r; reached = d
-            if r.get("_win"):
+    """Deadline-bounded search with completed-iteration fallback.
+
+    depth reports completed search only. timed_out marks an interrupted request.
+    With no time to validate any legal candidate (including zero budget), None
+    is returned. Time checks are cooperative, not an OS real-time guarantee.
+    """
+    start = time.perf_counter()
+    deadline = _deadline(start, time_budget)
+    if depth < 1 or width < 1:
+        raise ValueError("depth and width must be positive")
+    best = None
+    timed_out = False
+    try:
+        _check_deadline(deadline)
+        cands = _candidates(b)
+        # Keep a legal fallback even if later ordering or evaluation expires.
+        for r, c in cands:
+            _check_deadline(deadline)
+            if not is_forbidden(b, r, c, me, rule):
+                best = {"move": (r, c), "score": 0, "depth": 0,
+                        "reason": "합법 후보(탐색 미완료)"}
                 break
-            mv = r["move"]
-            cands = [mv] + [x for x in cands if x != mv]
-        if time.time() > deadline:
-            break
-    r0, c0 = best["move"]
-    off = place_score(b, r0, c0, me, rule)
-    dfn = 0 if is_forbidden(b, r0, c0, o, rule) else place_score(b, r0, c0, o, rule)
-    best["reason"] = _reason({"offense": off, "defense": dfn}, me, rule)
-    best["depth"] = reached
-    best.pop("_win", None)
+        if best is None:
+            return None
+        if all(value == 0 for row in b for value in row):
+            best.update(reason="첫 수(중앙)", timed_out=False,
+                        elapsed_ms=(time.perf_counter() - start) * 1000)
+            return best
+        immediate = _immediate_win_pt(b, me, rule, deadline)
+        if immediate is not None:
+            best.update(move=immediate, score=WIN, reason="즉시 승리(5목)",
+                        proof_status="PROVEN_WIN")
+        else:
+            o = opp(me)
+            threats = _gain_points(b, o, rule, deadline, limit=2)
+            if threats:
+                for r, c in threats:
+                    _check_deadline(deadline)
+                    if not is_forbidden(b, r, c, me, rule):
+                        best.update(move=(r, c), score=0 if len(threats) == 1 else -WIN,
+                                    reason="상대 5목 저지(필수 방어)" if len(threats) == 1
+                                    else "상대 다중 즉승 위협(패배 예상)")
+                        break
+                else:
+                    best.update(score=-WIN, reason="상대 즉승 방어점이 금수(패배 예상)")
+            else:
+                status, move = _proof_stage(
+                    _vcf, b, me, rule, 10, min(deadline, start + time_budget * .35))
+                reason = "강제승 발견(연속 사·VCF)"
+                if status != "PROVEN_WIN":
+                    status, move = _proof_stage(
+                        _forced_win_move, b, me, rule,
+                        min(deadline, start + time_budget * .5))
+                    reason = "필승수(포크·이중위협)"
+                if status == "PROVEN_WIN":
+                    best.update(move=move, score=WIN, reason=reason,
+                                proof_status=status)
+                else:
+                    # Unproven opponent searches no longer claim a successful
+                    # defense. Spend the remaining time on ordinary search.
+                    cands = _ordered(b, me, rule, width, deadline)
+                    if cands:
+                        best.update(move=cands[0], reason="후보 평가(탐색 미완료)")
+                    for d in range(1, depth + 1):
+                        result = _root_search(b, me, o, rule, cands, d, deadline)
+                        if result is not None:
+                            won = result.pop("_win", False)
+                            best = dict(result, depth=d, reason="탐색 평가")
+                            if won:
+                                best.update(reason="즉시 승리(5목)", proof_status="PROVEN_WIN")
+                                break
+                            move = result["move"]
+                            cands = [move] + [x for x in cands if x != move]
+    except _SearchTimeout:
+        timed_out = True
+    if best is not None:
+        best["timed_out"] = timed_out
+        best["elapsed_ms"] = (time.perf_counter() - start) * 1000
     return best
 
 
@@ -825,22 +879,31 @@ if __name__ == "__main__":
     # 5) 장목(6목) — 흑은 승리 아님
     b = empty_board(); put(b, BLACK, [(7, 3), (7, 4), (7, 5), (7, 6), (7, 8)])
     #  (7,7) 두면 3~8 여섯 → 장목
-    assert is_win(b, 7, 7, BLACK, "renju") is False or True  # 정확검증은 아래
+    with _placed(b, 7, 7, BLACK):
+        assert is_win(b, 7, 7, BLACK, "renju") is False
     b2 = empty_board(); put(b2, BLACK, [(7, 2), (7, 3), (7, 4), (7, 5), (7, 6)])
     # (7,7) 두면 2~7 여섯목 → 흑 장목(금수), 승리 아님
     print("[5] 흑 (7,7) 6목 승리?", is_win(b2, 7, 7, BLACK, "renju"), "| 금수?", is_forbidden(b2, 7, 7, BLACK, "renju"))
-    assert is_win(b2, 7, 7, BLACK, "renju") is False
+    with _placed(b2, 7, 7, BLACK):
+        assert is_win(b2, 7, 7, BLACK, "renju") is False
     assert is_forbidden(b2, 7, 7, BLACK, "renju") is True
-    # 백이면 6목 승리
+    # 기본 앱 호환 설정에서는 백도 장목 금지. 제한을 해제하면 6목 승리.
     b3 = empty_board(); put(b3, WHITE, [(7, 2), (7, 3), (7, 4), (7, 5), (7, 6)])
-    assert is_win(b3, 7, 7, WHITE, "renju") is True
-    print("[5b] 백 (7,7) 6목 승리?", is_win(b3, 7, 7, WHITE, "renju"))
+    with _placed(b3, 7, 7, WHITE):
+        assert is_win(b3, 7, 7, WHITE, "renju") is False
+        set_forbid(white={"overline": False})
+        try:
+            assert is_win(b3, 7, 7, WHITE, "renju") is True
+        finally:
+            set_forbid(white={"overline": True})
+    print("[5b] 백 장목 설정별 검증 OK")
 
     # 6) 일반룰: 삼삼 허용, 6목 승리
     b = empty_board(); put(b, BLACK, [(7, 5), (7, 6), (5, 7), (6, 7)])
     assert is_forbidden(b, 7, 7, BLACK, "standard") is False
     b2 = empty_board(); put(b2, BLACK, [(7, 2), (7, 3), (7, 4), (7, 5), (7, 6)])
-    assert is_win(b2, 7, 7, BLACK, "standard") is True
+    with _placed(b2, 7, 7, BLACK):
+        assert is_win(b2, 7, 7, BLACK, "standard") is True
     print("[6] 일반룰 삼삼 허용·6목 승리 OK")
 
     print("\n자체검증 통과 ✅")
